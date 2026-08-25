@@ -1,20 +1,14 @@
 name: BNB Meme Scanner
 
-# Runs one scan pass on a schedule, then exits. See README.md "GitHub
-# Actions mode" section for the minutes-budget math behind the interval
-# below, and for why this doesn't run continuously.
 on:
   schedule:
-    # Every 30 minutes. Adjust based on whether this repo is public
-    # (unlimited Actions minutes) or private (2,000 min/month cap) —
-    # see README for the exact math.
     - cron: "*/30 * * * *"
-  workflow_dispatch: {}  # lets you trigger a manual run from the Actions tab
+  workflow_dispatch: {}
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 8  # hard stop so a stuck run can't quietly burn your minute budget
+    timeout-minutes: 8
 
     steps:
       - name: Checkout
@@ -24,21 +18,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"  # caches installed deps between runs to save minutes
+          cache: "pip"
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # The SQLite DB tracks which pools we've already alerted on (so we
-      # don't spam the same token every run) and per-chat filters. Actions
-      # checkouts are ephemeral, so without this cache the bot would "forget"
-      # everything and re-alert on the same tokens every single run.
-      #
-      # Caveat, stated plainly: GitHub evicts caches unused for 7+ days or
-      # once a repo's total cache exceeds 10GB. If that happens here, the
-      # worst case is a few duplicate alerts until the DB rebuilds — not a
-      # correctness disaster, just noise. If that ever bothers you, swap
-      # this for a committed data file or an external key-value store.
       - name: Restore scanner database
         uses: actions/cache@v4
         with:
@@ -52,8 +36,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
-          MIN_MARKET_CAP_USD: ${{ vars.MIN_MARKET_CAP_USD }}
-          MAX_MARKET_CAP_USD: ${{ vars.MAX_MARKET_CAP_USD }}
-          MIN_LIQUIDITY_USD: ${{ vars.MIN_LIQUIDITY_USD }}
-          MIN_SCORE_TO_ALERT: ${{ vars.MIN_SCORE_TO_ALERT }}
+          # Product defaults are deliberately defined in config.py so old
+          # repository variables cannot widen the market-cap ceiling or hide
+          # sub-$50K tokens with an old score/liquidity threshold.
         run: python scan_once.py
