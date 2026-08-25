@@ -1,4 +1,4 @@
-"""Scan orchestration for BNB tokens below the hard $50K market-cap ceiling."""
+"""Production BNB micro-cap scanner: real MC + liquidity + activity + momentum."""
 import asyncio
 import logging
 from datasource import GeckoTerminalClient, PoolData
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 ALERT_COOLDOWN_SECONDS = 6 * 3600
 
 class Scanner:
-    def __init__(self, db: Database, telegram_bot=None):
+    def __init__(self, db, telegram_bot=None):
         self.db = db
         self.telegram_bot = telegram_bot
         self.gecko = GeckoTerminalClient(network=settings.network)
@@ -28,7 +28,7 @@ class Scanner:
                 logger.exception("Failed to fetch candidate pools")
         return list({p.pool_address: p for p in pools if p.pool_address}.values())
 
-    def _evaluate_pool_blocking(self, pool):
+    def _evaluate(self, pool):
         contract = self.bscscan.check_contract(pool.token_address) if pool.token_address else None
         honeypot = self.honeypot.check(pool.token_address, pool.pool_address) if pool.token_address else None
         score = score_pool(pool, contract, min_age_minutes=settings.min_pool_age_minutes,
@@ -44,17 +44,37 @@ class Scanner:
         score.top10_holder_pct = contract.top10_holder_pct if contract and contract.available else None
         return score
 
+    @staticmethod
+    def _activity_ok(pool):
+        tx1 = pool.buys_1h + pool.sells_1h
+        if pool.liquidity_usd < settings.min_liquidity_usd:
+            return False, "liquidity below floor"
+        if pool.volume_24h_usd < settings.min_volume_24h_usd:
+            return False, "24h volume below floor"
+        if tx1 < settings.min_1h_transactions:
+            return False, "insufficient 1h transactions"
+        if pool.buys_1h <= pool.sells_1h:
+            return False, "1h sell pressure"
+        return True, "ok"
+
     async def run_once(self):
         pools = await asyncio.to_thread(self._candidate_pools)
         logger.info("Fetched %d candidate pools", len(pools))
-        chat_id = settings.telegram_chat_id
         alerts_sent = 0
         failures = 0
 
         for pool in pools:
-            if not (pool.market_cap_usd > 0 and settings.min_market_cap_usd <= pool.market_cap_usd < settings.max_market_cap_usd):
+            # Hard market-cap rule: reported circulating MC only; FDV is never a substitute.
+            if not (settings.min_market_cap_usd <= pool.market_cap_usd < settings.max_market_cap_usd):
                 continue
-            score = await asyncio.to_thread(self._evaluate_pool_blocking, pool)
+            if not (settings.min_pool_age_minutes <= pool.age_minutes <= settings.max_pool_age_minutes):
+                continue
+            activity_ok, reason = self._activity_ok(pool)
+            if not activity_ok:
+                logger.info("SKIP %s: %s", pool.base_token_symbol, reason)
+                continue
+
+            score = await asyncio.to_thread(self._evaluate, pool)
             self.db.mark_seen(pool.pool_address, score.total)
             if score.blocked or score.total < settings.min_score_to_alert:
                 continue
@@ -62,16 +82,16 @@ class Scanner:
                 continue
             if not self.telegram_bot:
                 failures += 1
-                logger.error("Telegram sender is not configured")
                 continue
-            delivered = await self.telegram_bot.send_alert(chat_id, pool, score)
+
+            delivered = await self.telegram_bot.send_alert(settings.telegram_chat_id, pool, score)
             if delivered is not True:
                 failures += 1
-                logger.error("ALERT NOT SENT: %s score=%s mcap=%.0f", pool.base_token_symbol, score.total, pool.market_cap_usd)
+                logger.error("ALERT NOT SENT: %s score=%.1f mcap=%.0f", pool.base_token_symbol, score.total, pool.market_cap_usd)
                 continue
             self.db.record_alert(pool.pool_address, pool.base_token_symbol, score.total, pool.market_cap_usd)
             alerts_sent += 1
-            logger.info("ALERT SENT: %s score=%s mcap=%.0f", pool.base_token_symbol, score.total, pool.market_cap_usd)
+            logger.info("ALERT SENT: %s score=%.1f mcap=%.0f liq=%.0f vol24=%.0f", pool.base_token_symbol, score.total, pool.market_cap_usd, pool.liquidity_usd, pool.volume_24h_usd)
 
         if failures:
             raise RuntimeError(f"Telegram delivery failed for {failures} alert(s)")
