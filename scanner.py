@@ -1,11 +1,9 @@
 """
-The scanning loop: pull new + trending BSC pools, filter by market cap,
-score them, and alert registered chats whose thresholds are met.
+Scanner orchestration.
 
-All blocking network/rate-limit calls (GeckoTerminal, BscScan, honeypot.is)
-are offloaded to a worker thread via asyncio.to_thread. Without this, a
-throttled scan pass would freeze the event loop and make the Telegram bot
-stop responding to commands like /status mid-scan.
+Product rule: only BNB tokens below the configured hard $50K market-cap
+ceiling are candidates. Liquidity and other signals are audited/scored rather
+than silently filtering the token out before the audit is visible.
 """
 import asyncio
 import logging
@@ -17,8 +15,7 @@ from database import Database
 from config import settings
 
 logger = logging.getLogger(__name__)
-
-ALERT_COOLDOWN_SECONDS = 6 * 3600  # don't re-alert the same pool within 6h
+ALERT_COOLDOWN_SECONDS = 6 * 3600
 
 
 class Scanner:
@@ -40,7 +37,6 @@ class Scanner:
         except Exception:
             logger.exception("Failed to fetch trending_pools")
 
-        # de-dup by pool address
         seen = {}
         for p in pools:
             if p.pool_address:
@@ -48,44 +44,36 @@ class Scanner:
         return list(seen.values())
 
     def _passes_hard_filters(self, pool: PoolData, min_mcap: float, max_mcap: float) -> bool:
+        # Market cap is the only economic hard filter at discovery time.
+        # Liquidity is deliberately audited and scored so the Telegram alert
+        # can show exactly how strong/weak the pool is.
         if pool.market_cap_usd <= 0:
             return False
-        if not (min_mcap <= pool.market_cap_usd <= max_mcap):
-            return False
-        if pool.liquidity_usd < settings.min_liquidity_usd:
-            return False
-        return True
+        return min_mcap <= pool.market_cap_usd < max_mcap
 
     def _evaluate_pool_blocking(self, pool: PoolData):
-        """Runs the network-bound part of evaluating one pool. Called via
-        asyncio.to_thread so rate-limit sleeps never block the event loop."""
         contract = self.bscscan.check_contract(pool.token_address) if pool.token_address else None
         honeypot = self.honeypot.check(pool.token_address, pool.pool_address) if pool.token_address else None
-        score = score_pool(
+        return score_pool(
             pool,
             contract,
             min_age_minutes=settings.min_pool_age_minutes,
             max_age_minutes=settings.max_pool_age_minutes,
             honeypot=honeypot,
         )
-        return score
 
     async def run_once(self) -> int:
-        """Runs one full scan pass. Returns count of alerts sent."""
         pools = await asyncio.to_thread(self._candidate_pools)
         logger.info("Fetched %d candidate pools", len(pools))
-
         chats = self.db.all_registered_chats()
         alerts_sent = 0
 
         for pool in pools:
-            # Use the widest configured range across chats as a first-pass filter
-            # so we don't waste BscScan/honeypot calls on pools nobody cares about.
             if not chats:
                 widest_min, widest_max = settings.min_market_cap_usd, settings.max_market_cap_usd
             else:
                 widest_min = min(c["min_market_cap_usd"] for c in chats)
-                widest_max = max(c["max_market_cap_usd"] for c in chats)
+                widest_max = min(max(c["max_market_cap_usd"] for c in chats), settings.max_market_cap_usd)
 
             if not self._passes_hard_filters(pool, widest_min, widest_max):
                 continue
@@ -93,10 +81,9 @@ class Scanner:
             score = await asyncio.to_thread(self._evaluate_pool_blocking, pool)
             self.db.mark_seen(pool.pool_address, score.total)
 
+            # Confirmed honeypots remain the one hard security block.
             if score.blocked:
-                logger.info(
-                    "BLOCKED (honeypot): %s reason=%s", pool.base_token_symbol, score.blocked_reason
-                )
+                logger.info("BLOCKED (honeypot): %s reason=%s", pool.base_token_symbol, score.blocked_reason)
                 continue
 
             targets = chats or [{
@@ -109,9 +96,11 @@ class Scanner:
             for chat in targets:
                 if not chat["chat_id"]:
                     continue
-                if not (chat["min_market_cap_usd"] <= pool.market_cap_usd <= chat["max_market_cap_usd"]):
+                # Never allow a chat-specific setting to bypass the $50K product ceiling.
+                chat_max = min(float(chat["max_market_cap_usd"]), settings.max_market_cap_usd)
+                if not (float(chat["min_market_cap_usd"]) <= pool.market_cap_usd < chat_max):
                     continue
-                if score.total < chat["min_score_to_alert"]:
+                if score.total < float(chat["min_score_to_alert"]):
                     continue
                 if self.db.already_alerted_recently(pool.pool_address, ALERT_COOLDOWN_SECONDS):
                     continue
@@ -120,10 +109,7 @@ class Scanner:
                 alerts_sent += 1
                 if self.telegram_bot:
                     await self.telegram_bot.send_alert(chat["chat_id"], pool, score)
-                logger.info(
-                    "ALERT: %s score=%s mcap=%.0f chat=%s",
-                    pool.base_token_symbol, score.total, pool.market_cap_usd, chat["chat_id"],
-                )
+                logger.info("ALERT: %s score=%s mcap=%.0f chat=%s", pool.base_token_symbol, score.total, pool.market_cap_usd, chat["chat_id"])
 
         return alerts_sent
 
