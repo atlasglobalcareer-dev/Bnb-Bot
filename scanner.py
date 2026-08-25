@@ -59,8 +59,6 @@ class Scanner:
             honeypot=honeypot,
         )
 
-        # Preserve the raw audit results for Telegram formatting without making
-        # the scoring engine depend on presentation concerns.
         score.honeypot_checked = bool(honeypot and honeypot.checked)
         score.is_honeypot = honeypot.is_honeypot if honeypot else None
         score.buy_tax = honeypot.buy_tax if honeypot else None
@@ -113,11 +111,25 @@ class Scanner:
                 if self.db.already_alerted_recently(pool.pool_address, ALERT_COOLDOWN_SECONDS):
                     continue
 
+                delivered = True
+                if self.telegram_bot:
+                    delivered = await self.telegram_bot.send_alert(chat["chat_id"], pool, score)
+                    # Legacy persistent TelegramBot implementations may return
+                    # None on success; only an explicit False means delivery failed.
+                    if delivered is False:
+                        logger.error(
+                            "ALERT NOT SENT: %s score=%s mcap=%.0f chat=%s",
+                            pool.base_token_symbol,
+                            score.total,
+                            pool.market_cap_usd,
+                            chat["chat_id"],
+                        )
+                        continue
+
+                # Record the cooldown only after confirmed/assumed successful delivery.
                 self.db.record_alert(pool.pool_address, pool.base_token_symbol, score.total, pool.market_cap_usd)
                 alerts_sent += 1
-                if self.telegram_bot:
-                    await self.telegram_bot.send_alert(chat["chat_id"], pool, score)
-                logger.info("ALERT: %s score=%s mcap=%.0f chat=%s", pool.base_token_symbol, score.total, pool.market_cap_usd, chat["chat_id"])
+                logger.info("ALERT SENT: %s score=%s mcap=%.0f chat=%s", pool.base_token_symbol, score.total, pool.market_cap_usd, chat["chat_id"])
 
         return alerts_sent
 
