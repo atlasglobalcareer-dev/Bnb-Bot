@@ -1,18 +1,9 @@
 """
 One-shot entrypoint for GitHub Actions mode.
 
-Does exactly one thing: run a single scan pass, send any qualifying alerts
-directly via the Telegram Bot API, then exit. No polling, no scheduler, no
-interactive commands — those need a persistent process (see main.py for the
-VPS-hosted alternative with full /setmcap, /status, /scan support).
-
-Because there's no /start command to register a chat here, this auto-
-registers TELEGRAM_CHAT_ID from the environment using the configured
-filters on every run (idempotent — see Database.register_chat).
-
-Exit codes: 0 on a completed pass (even with 0 alerts), 1 on a config
-problem, so a bad .env/secrets setup fails loudly in the Actions log
-instead of silently doing nothing every run.
+Runs one scan pass after validating the configured Telegram bot and destination
+chat. Telegram failures are surfaced clearly instead of allowing a green job
+to imply that alerts were delivered.
 """
 import asyncio
 import logging
@@ -49,8 +40,12 @@ async def main():
     scanner = Scanner(db, telegram_bot=alert_sender)
 
     try:
+        # Validate the exact bot token + destination before spending time on a scan.
+        await alert_sender.validate_destination(settings.telegram_chat_id)
+        logger.info("Telegram configuration OK. Starting token scan.")
+
         count = await scanner.run_once()
-        logger.info("Scan complete. %d alert(s) sent.", count)
+        logger.info("Scan complete. %d alert(s) confirmed delivered.", count)
     finally:
         scanner.close()
 
