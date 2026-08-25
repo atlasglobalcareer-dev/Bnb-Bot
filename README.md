@@ -1,40 +1,57 @@
 # BNB Meme Scanner Bot
 
-A Telegram bot that scans the BNB Smart Chain for meme-coin pools, scores them using transparent on-chain signals, checks sellability with honeypot.is, and sends qualifying alerts to Telegram.
+A Telegram research scanner for the BNB Smart Chain focused on **tokens below $50,000 market cap**.
 
-## What it checks
+The scanner discovers new/trending BSC pools, runs the available market and security audits, calculates a transparent 0–100 score, blocks confirmed honeypots, and sends the audit report to Telegram.
 
-- Market-cap range
-- Liquidity / market-cap ratio
-- 24h volume / market-cap ratio
-- Buy/sell transaction pressure
-- Recent price momentum
+## Product rule
+
+**Hard market-cap ceiling: $50,000.** No alert may exceed this ceiling.
+
+Liquidity, volume, buy/sell pressure, momentum, pool age, contract verification, holder concentration and sellability are scored/reported rather than silently hiding a token before the audit.
+
+## What an alert contains
+
+- Market cap and liquidity
+- 24h volume
+- 1h / 6h / 24h price movement
+- Buy/sell transaction counts
 - Pool age
-- Optional BscScan contract verification and holder concentration
-- Honeypot/sellability simulation
+- 0–100 score and component breakdown
+- Honeypot/sellability status when available
+- Buy/sell tax when available
+- BscScan contract verification when available
+- Top-holder concentration when available
+- Owner status when available
+- Risk flags and warnings
+- GeckoTerminal chart link
 
-The score is a research/screening heuristic, not a price prediction or financial recommendation. Meme coins are extremely high risk; always perform your own due diligence.
+A confirmed honeypot is a hard block and is never alerted.
+
+## Important data-source limitation
+
+Some BscScan holder/contract fields can be unavailable depending on API access. The bot reports **UNKNOWN** rather than pretending an audit passed.
 
 ## Project layout
 
 ```text
 .
-├── .github/workflows/scan.yml   # Scheduled GitHub Actions scanner
-├── data/.gitkeep                # Runtime SQLite database directory
-├── logs/.gitkeep                # Runtime logs directory
-├── alert_sender.py              # One-shot Telegram sender
-├── bot.py                       # Interactive Telegram bot
-├── bscscan.py                   # Optional BscScan safety checks
-├── config.py                    # Environment/config loader
-├── database.py                  # SQLite persistence
-├── datasource.py                # GeckoTerminal BSC data client
-├── formatting.py                # Telegram alert formatting
-├── honeypot.py                  # Honeypot/sellability checks
-├── main.py                      # Persistent VPS entry point
-├── ratelimit.py                 # API rate limiter
-├── scan_once.py                 # One scan pass for GitHub Actions
-├── scanner.py                   # Scan/filter/score/alert orchestration
-├── scoring.py                   # 0–100 scoring engine
+├── .github/workflows/scan.yml
+├── data/.gitkeep
+├── logs/.gitkeep
+├── alert_sender.py
+├── bot.py
+├── bscscan.py
+├── config.py
+├── database.py
+├── datasource.py
+├── formatting.py
+├── honeypot.py
+├── main.py
+├── ratelimit.py
+├── scan_once.py
+├── scanner.py
+├── scoring.py
 ├── .env.example
 ├── .gitignore
 └── requirements.txt
@@ -42,22 +59,15 @@ The score is a research/screening heuristic, not a price prediction or financial
 
 ## GitHub Actions setup
 
-The workflow runs one scan every 30 minutes and can also be started manually from the Actions tab.
+The workflow runs a scan every 30 minutes and can also be started manually.
 
-In **Settings → Secrets and variables → Actions**, add these secrets:
+In **Settings → Secrets and variables → Actions**, add:
 
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
-- `BSCSCAN_API_KEY` (optional, recommended)
+- `BSCSCAN_API_KEY` (recommended)
 
-Optional Actions variables:
-
-- `MIN_MARKET_CAP_USD`
-- `MAX_MARKET_CAP_USD`
-- `MIN_LIQUIDITY_USD`
-- `MIN_SCORE_TO_ALERT`
-
-The workflow executes `python scan_once.py`, which performs one scan and exits.
+Optional variables are documented in `.env.example`. The hard $50K ceiling is enforced by application code even if an Actions variable is changed incorrectly.
 
 ## VPS mode
 
@@ -71,18 +81,6 @@ cp .env.example .env
 python main.py
 ```
 
-VPS mode supports `/start`, `/setmcap`, `/setscore`, `/status`, `/scan`, and `/watchlist`.
+## Risk notice
 
-## Configuration
-
-Example values are provided in `.env.example`. Never commit real Telegram or BscScan credentials. `.env` is ignored by Git.
-
-## Data sources
-
-- GeckoTerminal public API: pool discovery and market data.
-- honeypot.is public API: sellability/honeypot simulation.
-- BscScan API: optional contract verification and holder data.
-
-## License / risk notice
-
-This project is provided for research and screening purposes. Nothing in this repository guarantees returns or token performance. You are responsible for your own trading decisions and due diligence.
+This project is a research/screening tool. It does not predict prices or guarantee returns. BNB meme tokens are extremely high risk. Always perform independent due diligence before trading.
