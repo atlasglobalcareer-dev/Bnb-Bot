@@ -44,9 +44,6 @@ class Scanner:
         return list(seen.values())
 
     def _passes_hard_filters(self, pool: PoolData, min_mcap: float, max_mcap: float) -> bool:
-        # Market cap is the only economic hard filter at discovery time.
-        # Liquidity is deliberately audited and scored so the Telegram alert
-        # can show exactly how strong/weak the pool is.
         if pool.market_cap_usd <= 0:
             return False
         return min_mcap <= pool.market_cap_usd < max_mcap
@@ -54,13 +51,26 @@ class Scanner:
     def _evaluate_pool_blocking(self, pool: PoolData):
         contract = self.bscscan.check_contract(pool.token_address) if pool.token_address else None
         honeypot = self.honeypot.check(pool.token_address, pool.pool_address) if pool.token_address else None
-        return score_pool(
+        score = score_pool(
             pool,
             contract,
             min_age_minutes=settings.min_pool_age_minutes,
             max_age_minutes=settings.max_pool_age_minutes,
             honeypot=honeypot,
         )
+
+        # Preserve the raw audit results for Telegram formatting without making
+        # the scoring engine depend on presentation concerns.
+        score.honeypot_checked = bool(honeypot and honeypot.checked)
+        score.is_honeypot = honeypot.is_honeypot if honeypot else None
+        score.buy_tax = honeypot.buy_tax if honeypot else None
+        score.sell_tax = honeypot.sell_tax if honeypot else None
+        score.honeypot_reason = honeypot.simulation_error if honeypot else None
+        score.contract_available = bool(contract and contract.available)
+        score.contract_verified = contract.is_verified if contract and contract.available else None
+        score.owner_renounced = contract.owner_renounced if contract and contract.available else None
+        score.top10_holder_pct = contract.top10_holder_pct if contract and contract.available else None
+        return score
 
     async def run_once(self) -> int:
         pools = await asyncio.to_thread(self._candidate_pools)
@@ -72,8 +82,8 @@ class Scanner:
             if not chats:
                 widest_min, widest_max = settings.min_market_cap_usd, settings.max_market_cap_usd
             else:
-                widest_min = min(c["min_market_cap_usd"] for c in chats)
-                widest_max = min(max(c["max_market_cap_usd"] for c in chats), settings.max_market_cap_usd)
+                widest_min = min(float(c["min_market_cap_usd"]) for c in chats)
+                widest_max = min(max(float(c["max_market_cap_usd"]) for c in chats), settings.max_market_cap_usd)
 
             if not self._passes_hard_filters(pool, widest_min, widest_max):
                 continue
@@ -81,7 +91,6 @@ class Scanner:
             score = await asyncio.to_thread(self._evaluate_pool_blocking, pool)
             self.db.mark_seen(pool.pool_address, score.total)
 
-            # Confirmed honeypots remain the one hard security block.
             if score.blocked:
                 logger.info("BLOCKED (honeypot): %s reason=%s", pool.base_token_symbol, score.blocked_reason)
                 continue
@@ -96,7 +105,6 @@ class Scanner:
             for chat in targets:
                 if not chat["chat_id"]:
                     continue
-                # Never allow a chat-specific setting to bypass the $50K product ceiling.
                 chat_max = min(float(chat["max_market_cap_usd"]), settings.max_market_cap_usd)
                 if not (float(chat["min_market_cap_usd"]) <= pool.market_cap_usd < chat_max):
                     continue
