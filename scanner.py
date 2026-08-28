@@ -44,22 +44,38 @@ class Scanner:
         score.top10_holder_pct = contract.top10_holder_pct if contract and contract.available else None
         return score
 
-    @staticmethod
-    def _activity_ok(pool):
-        tx1 = pool.buys_1h + pool.sells_1h
-        if pool.liquidity_usd < settings.min_liquidity_usd:
-            return False, "liquidity below floor"
-        if pool.volume_24h_usd < settings.min_volume_24h_usd:
-            return False, "24h volume below floor"
-        if tx1 < settings.min_1h_transactions:
-            return False, "insufficient 1h transactions"
-        if pool.buys_1h <= pool.sells_1h:
-            return False, "1h sell pressure"
-        return True, "ok"
+    async def _enrich_market_caps(self, pools):
+        """Fetch pool-detail data for candidates whose list endpoint omitted MC."""
+        enriched = 0
+        failed = 0
+        for pool in pools:
+            if pool.market_cap_usd > 0:
+                continue
+            try:
+                detail = await asyncio.to_thread(self.gecko.pool_detail, pool.pool_address)
+                if detail and detail.market_cap_usd > 0:
+                    # Keep the original candidate object for identity, but use the
+                    # authoritative detail response for all refreshed pool metrics.
+                    pool.__dict__.update(detail.__dict__)
+                    enriched += 1
+                    logger.info("MC ENRICHED %s: market_cap=%.0f", pool.base_token_symbol, pool.market_cap_usd)
+                else:
+                    failed += 1
+                    logger.info("MC ENRICH FAILED %s: pool detail has no reported market cap", pool.base_token_symbol)
+            except Exception:
+                failed += 1
+                logger.exception("MC ENRICH ERROR %s", pool.base_token_symbol)
+        logger.info("MC ENRICHMENT SUMMARY: missing_initial=%d enriched=%d still_missing=%d", len([p for p in pools if p.market_cap_usd <= 0]) + enriched, enriched, failed)
+        return pools
 
     async def run_once(self):
         pools = await asyncio.to_thread(self._candidate_pools)
         logger.info("Fetched %d candidate pools", len(pools))
+        initial_missing_mc = sum(1 for p in pools if p.market_cap_usd <= 0)
+        if initial_missing_mc:
+            logger.info("Attempting pool-detail market-cap enrichment for %d candidates", initial_missing_mc)
+            pools = await self._enrich_market_caps(pools)
+
         stats = {
             "mc_missing_or_zero": 0,
             "mc_below_min": 0,
@@ -159,7 +175,7 @@ class Scanner:
                     len(pools), stats["mc_missing_or_zero"], stats["mc_below_min"], stats["mc_at_or_above_max"],
                     stats["age_too_new"], stats["age_too_old"], stats["liquidity_below_floor"], stats["volume_below_floor"],
                     stats["transactions_below_floor"], stats["sell_pressure"], stats["reached_scoring"], stats["blocked_by_audit"],
-                    stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_not_configured"],
+                    stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_unconfigured"],
                     stats["telegram_delivery_failed"], stats["alerts_sent"])
 
         if failures:
