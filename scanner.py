@@ -45,27 +45,39 @@ class Scanner:
         return score
 
     async def _enrich_market_caps(self, pools):
-        """Fetch pool-detail data for candidates whose list endpoint omitted MC."""
-        enriched = 0
-        failed = 0
+        """Try GeckoTerminal detail first, then DexScreener pair market cap."""
+        initial_missing = sum(1 for p in pools if p.market_cap_usd <= 0)
+        gecko_enriched = 0
+        dex_enriched = 0
+        still_missing = 0
         for pool in pools:
             if pool.market_cap_usd > 0:
                 continue
             try:
                 detail = await asyncio.to_thread(self.gecko.pool_detail, pool.pool_address)
                 if detail and detail.market_cap_usd > 0:
-                    # Keep the original candidate object for identity, but use the
-                    # authoritative detail response for all refreshed pool metrics.
                     pool.__dict__.update(detail.__dict__)
-                    enriched += 1
-                    logger.info("MC ENRICHED %s: market_cap=%.0f", pool.base_token_symbol, pool.market_cap_usd)
-                else:
-                    failed += 1
-                    logger.info("MC ENRICH FAILED %s: pool detail has no reported market cap", pool.base_token_symbol)
+                    gecko_enriched += 1
+                    logger.info("MC ENRICHED %s: source=GeckoTerminal market_cap=%.0f", pool.base_token_symbol, pool.market_cap_usd)
+                    continue
             except Exception:
-                failed += 1
-                logger.exception("MC ENRICH ERROR %s", pool.base_token_symbol)
-        logger.info("MC ENRICHMENT SUMMARY: missing_initial=%d enriched=%d still_missing=%d", len([p for p in pools if p.market_cap_usd <= 0]) + enriched, enriched, failed)
+                logger.exception("MC GECKO DETAIL ERROR %s", pool.base_token_symbol)
+
+            try:
+                mc = await asyncio.to_thread(self.gecko.dexscreener_market_cap, pool.pool_address)
+                if mc > 0:
+                    pool.market_cap_usd = mc
+                    dex_enriched += 1
+                    logger.info("MC ENRICHED %s: source=DexScreener market_cap=%.0f", pool.base_token_symbol, mc)
+                    continue
+            except Exception:
+                logger.exception("MC DEXSCREENER ERROR %s", pool.base_token_symbol)
+
+            still_missing += 1
+            logger.info("MC ENRICH FAILED %s: no reported market cap from GeckoTerminal or DexScreener", pool.base_token_symbol)
+
+        logger.info("MC ENRICHMENT SUMMARY: missing_initial=%d gecko_enriched=%d dexscreener_enriched=%d still_missing=%d",
+                    initial_missing, gecko_enriched, dex_enriched, still_missing)
         return pools
 
     async def run_once(self):
@@ -73,31 +85,20 @@ class Scanner:
         logger.info("Fetched %d candidate pools", len(pools))
         initial_missing_mc = sum(1 for p in pools if p.market_cap_usd <= 0)
         if initial_missing_mc:
-            logger.info("Attempting pool-detail market-cap enrichment for %d candidates", initial_missing_mc)
+            logger.info("Attempting market-cap enrichment for %d candidates", initial_missing_mc)
             pools = await self._enrich_market_caps(pools)
 
         stats = {
-            "mc_missing_or_zero": 0,
-            "mc_below_min": 0,
-            "mc_at_or_above_max": 0,
-            "age_too_new": 0,
-            "age_too_old": 0,
-            "liquidity_below_floor": 0,
-            "volume_below_floor": 0,
-            "transactions_below_floor": 0,
-            "sell_pressure": 0,
-            "reached_scoring": 0,
-            "blocked_by_audit": 0,
-            "score_below_threshold": 0,
-            "already_alerted_recently": 0,
-            "telegram_not_configured": 0,
-            "telegram_delivery_failed": 0,
-            "alerts_sent": 0,
+            "mc_missing_or_zero": 0, "mc_below_min": 0, "mc_at_or_above_max": 0,
+            "age_too_new": 0, "age_too_old": 0, "liquidity_below_floor": 0,
+            "volume_below_floor": 0, "transactions_below_floor": 0, "sell_pressure": 0,
+            "reached_scoring": 0, "blocked_by_audit": 0, "score_below_threshold": 0,
+            "already_alerted_recently": 0, "telegram_unconfigured": 0,
+            "telegram_delivery_failed": 0, "alerts_sent": 0,
         }
         failures = 0
 
         for pool in pools:
-            # Hard market-cap rule: reported circulating MC only; FDV is never a substitute.
             mc = pool.market_cap_usd
             if mc is None or mc <= 0:
                 stats["mc_missing_or_zero"] += 1
@@ -111,7 +112,6 @@ class Scanner:
                 stats["mc_at_or_above_max"] += 1
                 logger.info("FILTER %s: MC at/above $50K ceiling (mc=%.0f)", pool.base_token_symbol, mc)
                 continue
-
             if pool.age_minutes < settings.min_pool_age_minutes:
                 stats["age_too_new"] += 1
                 logger.info("FILTER %s: pool too new (age=%.1f min)", pool.base_token_symbol, pool.age_minutes)
@@ -120,7 +120,6 @@ class Scanner:
                 stats["age_too_old"] += 1
                 logger.info("FILTER %s: pool too old (age=%.1f min)", pool.base_token_symbol, pool.age_minutes)
                 continue
-
             if pool.liquidity_usd < settings.min_liquidity_usd:
                 stats["liquidity_below_floor"] += 1
                 logger.info("FILTER %s: liquidity below floor (liq=%.0f min=%.0f)", pool.base_token_symbol, pool.liquidity_usd, settings.min_liquidity_usd)
@@ -156,7 +155,7 @@ class Scanner:
                 logger.info("FILTER %s: alert cooldown active", pool.base_token_symbol)
                 continue
             if not self.telegram_bot:
-                stats["telegram_not_configured"] += 1
+                stats["telegram_unconfigured"] += 1
                 failures += 1
                 logger.error("ALERT NOT SENT %s: Telegram bot not configured", pool.base_token_symbol)
                 continue
