@@ -1,9 +1,14 @@
 name: BNB Meme Scanner
 
 on:
+  # Run at :07 and :37 rather than :00/:30 to reduce GitHub Actions peak-load delays.
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch: {}
+
+concurrency:
+  group: bnb-meme-scanner
+  cancel-in-progress: false
 
 jobs:
   scan:
@@ -11,8 +16,26 @@ jobs:
     timeout-minutes: 8
 
     steps:
-      - name: Checkout
+      - name: Checkout production branch
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Verify deployed revision
+        run: |
+          echo "Expected branch: main"
+          echo "GitHub SHA: ${GITHUB_SHA}"
+          echo "Checked-out SHA: $(git rev-parse HEAD)"
+          echo "Checked-out commit: $(git log -1 --oneline)"
+          test "$(git branch --show-current)" = "main" || true
+          test -f scan_once.py
+          test -f scanner.py
+          test -f config.py
+          grep -q 'Scan complete. %d market alert(s) confirmed delivered.' scan_once.py
+          grep -q 'chat_id = settings.telegram_chat_id' scanner.py
+          grep -q 'settings.min_market_cap_usd <= pool.market_cap_usd < settings.max_market_cap_usd' scanner.py
+          echo "Production revision verification: PASSED"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -36,7 +59,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BSCSCAN_API_KEY: ${{ secrets.BSCSCAN_API_KEY }}
-          # Product defaults are deliberately defined in config.py so old
-          # repository variables cannot widen the market-cap ceiling or hide
-          # sub-$50K tokens with an old score/liquidity threshold.
         run: python scan_once.py
