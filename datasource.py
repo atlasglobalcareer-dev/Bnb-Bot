@@ -18,8 +18,6 @@ class PoolData:
         self.name = attrs.get("name", "unknown")
         self.base_token_symbol = self.name.split("/")[0].strip() if "/" in self.name else self.name
         self.price_usd = _to_float(attrs.get("base_token_price_usd"))
-        # IMPORTANT: do not substitute FDV for market cap. A token with no
-        # reported circulating market cap must not be presented as a <$50K MC pick.
         self.market_cap_usd = _to_float(attrs.get("market_cap_usd"))
         self.fdv_usd = _to_float(attrs.get("fdv_usd"))
         self.liquidity_usd = _to_float(attrs.get("reserve_in_usd"))
@@ -93,7 +91,6 @@ class GeckoTerminalClient:
         return PoolData(item) if item else None
 
     def dexscreener_market_cap(self, pool_address):
-        """Secondary MC source for pools where GeckoTerminal reports no MC."""
         _dex_rate_limiter.acquire()
         resp = self._dex_client.get(f"/latest/dex/pairs/{self.network}/{pool_address}")
         resp.raise_for_status()
@@ -105,6 +102,14 @@ class GeckoTerminalClient:
             if mc > 0:
                 return mc
         return 0.0
+
+    def search_token_pairs(self, token_address):
+        """Discover BSC pairs for a token so we can use a pair with reported MC."""
+        _dex_rate_limiter.acquire()
+        resp = self._dex_client.get("/latest/dex/search", params={"q": token_address})
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+        return [p for p in pairs if str(p.get("chainId", "")).lower() == self.network]
 
     def close(self):
         self._client.close()
