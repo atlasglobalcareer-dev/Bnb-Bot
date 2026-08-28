@@ -1,12 +1,15 @@
-"""GeckoTerminal BNB Chain pool data source."""
+"""GeckoTerminal + DexScreener BNB Chain market data sources."""
 import httpx
 from datetime import datetime, timezone
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ratelimit import RateLimiter
 
 BASE_URL = "https://api.geckoterminal.com/api/v2"
+DEXSCREENER_URL = "https://api.dexscreener.com"
 HEADERS = {"Accept": "application/json;version=20230302"}
+DEX_HEADERS = {"Accept": "application/json"}
 _rate_limiter = RateLimiter(max_calls=28, period_seconds=60)
+_dex_rate_limiter = RateLimiter(max_calls=250, period_seconds=60)
 
 class PoolData:
     def __init__(self, raw: dict):
@@ -67,6 +70,7 @@ class GeckoTerminalClient:
     def __init__(self, network="bsc"):
         self.network = network
         self._client = httpx.Client(base_url=BASE_URL, headers=HEADERS, timeout=15.0)
+        self._dex_client = httpx.Client(base_url=DEXSCREENER_URL, headers=DEX_HEADERS, timeout=15.0)
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     def _get(self, path, params=None):
@@ -88,5 +92,20 @@ class GeckoTerminalClient:
         item = data.get("data")
         return PoolData(item) if item else None
 
+    def dexscreener_market_cap(self, pool_address):
+        """Secondary MC source for pools where GeckoTerminal reports no MC."""
+        _dex_rate_limiter.acquire()
+        resp = self._dex_client.get(f"/latest/dex/pairs/{self.network}/{pool_address}")
+        resp.raise_for_status()
+        pairs = resp.json().get("pairs") or []
+        for pair in pairs:
+            if str(pair.get("pairAddress", "")).lower() != str(pool_address).lower():
+                continue
+            mc = _to_float(pair.get("marketCap"))
+            if mc > 0:
+                return mc
+        return 0.0
+
     def close(self):
         self._client.close()
+        self._dex_client.close()
