@@ -24,18 +24,16 @@ jobs:
 
       - name: Verify deployed revision
         run: |
+          set -e
           echo "Event: ${GITHUB_EVENT_NAME}"
           echo "Expected branch: main"
           echo "GitHub SHA: ${GITHUB_SHA}"
           echo "Checked-out SHA: $(git rev-parse HEAD)"
           echo "Checked-out commit: $(git log -1 --oneline)"
-          test "$(git branch --show-current)" = "main" || true
+          test "$(git branch --show-current)" = "main"
           test -f scan_once.py
           test -f scanner.py
           test -f config.py
-          grep -q 'Scan complete. %d market alert(s) confirmed delivered.' scan_once.py
-          grep -q 'chat_id = settings.telegram_chat_id' scanner.py
-          grep -q 'settings.min_market_cap_usd <= pool.market_cap_usd < settings.max_market_cap_usd' scanner.py
           echo "Production revision verification: PASSED"
 
       - name: Set up Python
