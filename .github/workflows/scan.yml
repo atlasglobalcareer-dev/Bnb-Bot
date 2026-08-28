@@ -1,9 +1,9 @@
 name: BNB Meme Scanner
 
 on:
-  # Run at :07 and :37 rather than :00/:30 to reduce GitHub Actions peak-load delays.
+  # Run every 30 minutes. GitHub evaluates cron in UTC.
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 concurrency:
@@ -24,6 +24,7 @@ jobs:
 
       - name: Verify deployed revision
         run: |
+          echo "Event: ${GITHUB_EVENT_NAME}"
           echo "Expected branch: main"
           echo "GitHub SHA: ${GITHUB_SHA}"
           echo "Checked-out SHA: $(git rev-parse HEAD)"
