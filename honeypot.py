@@ -1,39 +1,19 @@
-"""
-Honeypot check via honeypot.is public API (free, no key required).
-Docs: https://api.honeypot.is/
-
-This is the single highest-value safety check in this whole project: it
-actually simulates a buy + sell against the live contract/router and tells
-you whether selling reverts, or what the effective buy/sell tax is. Liquidity
-and holder-concentration heuristics can only ever *suggest* rug risk — this
-check directly answers "can I get out."
-
-If the API is unreachable or the token isn't recognized, we return an
-"unknown" result rather than pretending it's safe. The scanner treats
-"unknown" as neutral, not as a pass.
-"""
+"""Honeypot check via honeypot.is public API (free, no key required)."""
 import httpx
 from dataclasses import dataclass
 from tenacity import retry, stop_after_attempt, wait_exponential
 from ratelimit import RateLimiter
 
 BASE_URL = "https://api.honeypot.is/v2"
-
-# honeypot.is doesn't publish a rate limit. Kept deliberately conservative
-# since a 429 here means a token silently skips the sellability check
-# entirely (see the "unknown -> neutral" fallback in scoring.py) — better
-# to go slow than to lose the most important safety check in the pipeline.
 _rate_limiter = RateLimiter(max_calls=1, period_seconds=1.2)
-
 
 @dataclass
 class HoneypotResult:
-    checked: bool = False           # did we get a real answer back
-    is_honeypot: bool | None = None  # True/False/None (unknown)
+    checked: bool = False
+    is_honeypot: bool | None = None
     buy_tax: float | None = None
     sell_tax: float | None = None
     simulation_error: str | None = None
-
 
 class HoneypotClient:
     def __init__(self):
@@ -46,31 +26,53 @@ class HoneypotClient:
         resp.raise_for_status()
         return resp.json()
 
-    def check(self, token_address: str, pair_address: str | None = None) -> HoneypotResult:
-        result = HoneypotResult()
-        if not token_address:
-            return result
-        try:
-            params = {"address": token_address, "chainID": 56}  # 56 = BSC
-            if pair_address:
-                params["pair"] = pair_address
-            data = self._get("/IsHoneypot", params)
-
-            honeypot_result = data.get("honeypotResult", {}) or {}
-            simulation = data.get("simulationResult", {}) or {}
-
-            result.checked = True
-            result.is_honeypot = honeypot_result.get("isHoneypot")
-            result.simulation_error = honeypot_result.get("honeypotReason")
-            result.buy_tax = simulation.get("buyTax")
-            result.sell_tax = simulation.get("sellTax")
-        except Exception as e:
-            # Network error, rate limit, or token not recognized yet (very new
-            # pools sometimes aren't indexed for a few minutes). Stay honest
-            # about not knowing rather than defaulting to "safe".
+    def _check_once(self, token_address: str, pair_address: str | None) -> HoneypotResult:
+        params = {"address": token_address, "chainID": 56}
+        if pair_address:
+            params["pair"] = pair_address
+        data = self._get("/IsHoneypot", params)
+        hp = data.get("honeypotResult", {}) or {}
+        sim = data.get("simulationResult", {}) or {}
+        result = HoneypotResult(
+            checked=True,
+            is_honeypot=hp.get("isHoneypot"),
+            buy_tax=sim.get("buyTax"),
+            sell_tax=sim.get("sellTax"),
+            simulation_error=hp.get("honeypotReason"),
+        )
+        if result.is_honeypot is None:
             result.checked = False
-            result.simulation_error = str(e)
+            result.simulation_error = result.simulation_error or "API returned no definitive honeypot result"
         return result
+
+    def check(self, token_address: str, pair_address: str | None = None) -> HoneypotResult:
+        if not token_address:
+            return HoneypotResult(simulation_error="missing token address")
+        try:
+            result = self._check_once(token_address, pair_address)
+            if result.checked:
+                return result
+            # Some newly-created BSC pairs are not recognized correctly when
+            # the pair hint is supplied. Retry by token only before declaring
+            # the safety check unavailable.
+            if pair_address:
+                try:
+                    fallback = self._check_once(token_address, None)
+                    if fallback.checked:
+                        return fallback
+                    result.simulation_error = fallback.simulation_error or result.simulation_error
+                except Exception as e:
+                    result.simulation_error = f"pair and token-only checks failed: {e}"
+            return result
+        except Exception as first_error:
+            if pair_address:
+                try:
+                    return self._check_once(token_address, None)
+                except Exception as second_error:
+                    return HoneypotResult(
+                        simulation_error=f"pair check failed: {first_error}; token-only check failed: {second_error}"
+                    )
+            return HoneypotResult(simulation_error=str(first_error))
 
     def close(self):
         self._client.close()
