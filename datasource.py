@@ -1,4 +1,5 @@
 """GeckoTerminal + DexScreener BNB Chain market data sources."""
+import time
 import httpx
 from datetime import datetime, timezone
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -8,8 +9,9 @@ BASE_URL = "https://api.geckoterminal.com/api/v2"
 DEXSCREENER_URL = "https://api.dexscreener.com"
 HEADERS = {"Accept": "application/json;version=20230302"}
 DEX_HEADERS = {"Accept": "application/json"}
-_rate_limiter = RateLimiter(max_calls=28, period_seconds=60)
-_dex_rate_limiter = RateLimiter(max_calls=250, period_seconds=60)
+# Stay below GeckoTerminal's public rate limit and avoid burst retries.
+_rate_limiter = RateLimiter(max_calls=20, period_seconds=60)
+_dex_rate_limiter = RateLimiter(max_calls=200, period_seconds=60)
 
 class PoolData:
     def __init__(self, raw: dict):
@@ -70,10 +72,15 @@ class GeckoTerminalClient:
         self._client = httpx.Client(base_url=BASE_URL, headers=HEADERS, timeout=15.0)
         self._dex_client = httpx.Client(base_url=DEXSCREENER_URL, headers=DEX_HEADERS, timeout=15.0)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
     def _get(self, path, params=None):
         _rate_limiter.acquire()
         resp = self._client.get(path, params=params or {})
+        if resp.status_code == 429:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                try: time.sleep(min(float(retry_after), 30.0))
+                except ValueError: pass
         resp.raise_for_status()
         return resp.json()
 
