@@ -93,12 +93,19 @@ class Scanner:
             if ratio < settings.min_buy_sell_ratio: stats["sell_pressure"] += 1; continue
             stats["reached_scoring"] += 1
             score = await asyncio.to_thread(self._evaluate, pool); self.db.mark_seen(pool.pool_address, score.total)
-            # Security is a hard gate: unknown/unverified/high-tax/risky ownership never alerts.
-            if not score.honeypot_checked or score.is_honeypot is None: stats["unknown_honeypot"] += 1; logger.info("BLOCK %s: honeypot result unknown", pool.base_token_symbol); continue
-            if score.is_honeypot: stats["blocked_by_audit"] += 1; continue
+            # Security gate: confirmed honeypots always block. An unavailable/unknown
+            # honeypot result is NOT treated as safe; it may alert only as UNVERIFIED.
+            if score.honeypot_checked and score.is_honeypot is True:
+                stats["blocked_by_audit"] += 1; logger.info("BLOCK %s: confirmed honeypot", pool.base_token_symbol); continue
+            if not score.honeypot_checked or score.is_honeypot is None:
+                stats["unknown_honeypot"] += 1
+                logger.info("UNVERIFIED %s: honeypot result unavailable", pool.base_token_symbol)
             if not score.contract_available or score.contract_verified is not True: stats["unverified_contract"] += 1; continue
-            if score.buy_tax is not None and score.buy_tax > settings.max_buy_tax_pct: stats["bad_tax"] += 1; continue
-            if score.sell_tax is None or score.sell_tax > settings.max_sell_tax_pct: stats["bad_tax"] += 1; continue
+            # Tax limits only apply when the honeypot service actually returned a
+            # definitive result. Unknown results are explicitly marked UNVERIFIED.
+            if score.honeypot_checked:
+                if score.buy_tax is not None and score.buy_tax > settings.max_buy_tax_pct: stats["bad_tax"] += 1; continue
+                if score.sell_tax is None or score.sell_tax > settings.max_sell_tax_pct: stats["bad_tax"] += 1; continue
             if score.owner_renounced is False: stats["bad_owner"] += 1; continue
             if score.top10_holder_pct is None or score.top10_holder_pct > 60: stats["bad_holders"] += 1; continue
             if score.total < settings.min_score_to_alert: stats["score_below_threshold"] += 1; continue
