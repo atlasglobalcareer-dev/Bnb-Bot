@@ -21,7 +21,10 @@ def format_alert(pool: PoolData, score: ScoreBreakdown) -> str:
         lines.append(f"🛡 Honeypot: {'YES — BLOCKED' if hp_value is True else 'NO — passed'}")
         if buy_tax is not None: lines.append(f"💸 Buy tax: {buy_tax:.2f}%")
         if sell_tax is not None: lines.append(f"💸 Sell tax: {sell_tax:.2f}%")
-    else: lines.append("🛡 Honeypot: UNKNOWN / check unavailable")
+    else:
+        lines.append("🟡 Honeypot: UNVERIFIED / check unavailable")
+        reason = getattr(score, "honeypot_reason", None)
+        if reason: lines.append(f"   Reason: {reason}")
     verified = getattr(score, "contract_verified", None); holder_pct = getattr(score, "top10_holder_pct", None); owner_renounced = getattr(score, "owner_renounced", None)
     lines.append(f"📜 Contract verified: {'YES' if verified is True else 'NO' if verified is False else 'UNKNOWN'}")
     lines.append(f"👥 Top 10 holders: {holder_pct:.2f}%" if holder_pct is not None else "👥 Top 10 holders: UNKNOWN")
