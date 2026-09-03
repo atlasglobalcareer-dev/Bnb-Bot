@@ -41,35 +41,99 @@ class Scanner:
         score.top10_holder_pct = contract.top10_holder_pct if contract and contract.available else None
         return score
 
+    @staticmethod
+    def _usable_dex_pairs(pairs):
+        usable = []
+        for pair in pairs or []:
+            try:
+                mc = float(pair.get("marketCap") or 0)
+                liq = float((pair.get("liquidity") or {}).get("usd") or 0)
+            except (TypeError, ValueError):
+                continue
+            if mc > 0 and liq > 0:
+                usable.append(pair)
+        return sorted(usable, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+
+    @staticmethod
+    def _apply_dex_pair(pool, pair):
+        """Fill only market-data fields that DexScreener actually reports.
+        Never substitute FDV for market cap: the scanner requires real MC.
+        """
+        mc = float(pair.get("marketCap") or 0)
+        if mc <= 0:
+            return False
+        pool.market_cap_usd = mc
+        pool.price_usd = float(pair.get("priceUsd") or pool.price_usd or 0)
+        pool.liquidity_usd = float((pair.get("liquidity") or {}).get("usd") or pool.liquidity_usd or 0)
+        vol = pair.get("volume") or {}
+        if float(vol.get("h24") or 0) > 0:
+            pool.volume_24h_usd = float(vol.get("h24"))
+        if float(vol.get("h6") or 0) > 0:
+            pool.volume_6h_usd = float(vol.get("h6"))
+        if float(vol.get("h1") or 0) > 0:
+            pool.volume_1h_usd = float(vol.get("h1"))
+        tx = pair.get("txns") or {}
+        h1 = tx.get("h1") or {}
+        if h1:
+            pool.buys_1h = int(h1.get("buys") or pool.buys_1h or 0)
+            pool.sells_1h = int(h1.get("sells") or pool.sells_1h or 0)
+        pc = pair.get("priceChange") or {}
+        if pc.get("h1") is not None: pool.price_change_1h = float(pc.get("h1") or 0)
+        if pc.get("h6") is not None: pool.price_change_6h = float(pc.get("h6") or 0)
+        if pc.get("h24") is not None: pool.price_change_24h = float(pc.get("h24") or 0)
+        return True
+
     async def _enrich_market_caps(self, pools):
         initial_missing = sum(1 for p in pools if p.market_cap_usd <= 0)
-        gecko_enriched = dex_pair_enriched = dex_search_enriched = still_missing = 0
-        # Prefer DexScreener for missing MC. It has a much larger public request budget
-        # and avoids spending GeckoTerminal quota on one detail request per candidate.
+        gecko_enriched = dex_pair_enriched = dex_token_enriched = dex_search_enriched = still_missing = 0
         for pool in pools:
-            if pool.market_cap_usd > 0: continue
+            if pool.market_cap_usd > 0:
+                continue
+            # 1) Exact pair lookup: safest match to the candidate pool.
             try:
                 mc = await asyncio.to_thread(self.gecko.dexscreener_market_cap, pool.pool_address)
                 if mc > 0:
-                    pool.market_cap_usd = mc; dex_pair_enriched += 1; continue
-            except Exception: logger.exception("MC DEX PAIR ERROR %s", pool.base_token_symbol)
-            if pool.token_address:
-                try:
-                    pairs = await asyncio.to_thread(self.gecko.search_token_pairs, pool.token_address)
-                    usable = [p for p in pairs if float(p.get("marketCap") or 0) > 0 and float((p.get("liquidity") or {}).get("usd") or 0) > 0]
-                    usable.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
-                    if usable:
-                        pool.market_cap_usd = float(usable[0]["marketCap"]); dex_search_enriched += 1; continue
-                except Exception: logger.exception("MC DEX SEARCH ERROR %s", pool.base_token_symbol)
-            # Gecko detail is now a last-resort fallback, preventing 50+ missing-MC
-            # candidates from exhausting the GeckoTerminal request budget in one pass.
+                    pool.market_cap_usd = mc
+                    dex_pair_enriched += 1
+                    continue
+            except Exception:
+                logger.warning("DexScreener pair MC lookup failed for %s", pool.base_token_symbol)
+            if not pool.token_address:
+                still_missing += 1
+                continue
+            # 2) Token endpoint: more reliable than /search for an exact contract.
+            try:
+                pairs = await asyncio.to_thread(self.gecko.token_pairs, pool.token_address)
+                usable = self._usable_dex_pairs(pairs)
+                exact = [p for p in usable if str(p.get("pairAddress", "")).lower() == pool.pool_address.lower()]
+                chosen = exact[0] if exact else (usable[0] if usable else None)
+                if chosen and self._apply_dex_pair(pool, chosen):
+                    dex_token_enriched += 1
+                    continue
+            except Exception:
+                logger.warning("DexScreener token lookup failed for %s", pool.base_token_symbol)
+            # 3) Search endpoint fallback.
+            try:
+                pairs = await asyncio.to_thread(self.gecko.search_token_pairs, pool.token_address)
+                usable = self._usable_dex_pairs(pairs)
+                exact = [p for p in usable if str(p.get("pairAddress", "")).lower() == pool.pool_address.lower()]
+                chosen = exact[0] if exact else (usable[0] if usable else None)
+                if chosen and self._apply_dex_pair(pool, chosen):
+                    dex_search_enriched += 1
+                    continue
+            except Exception:
+                logger.warning("DexScreener search failed for %s", pool.base_token_symbol)
+            # 4) Gecko detail is last resort only; rate limiting prevents a burst.
             try:
                 detail = await asyncio.to_thread(self.gecko.pool_detail, pool.pool_address)
                 if detail and detail.market_cap_usd > 0:
-                    pool.__dict__.update(detail.__dict__); gecko_enriched += 1; continue
-            except Exception: logger.exception("MC GECKO DETAIL ERROR %s", pool.base_token_symbol)
+                    pool.__dict__.update(detail.__dict__)
+                    gecko_enriched += 1
+                    continue
+            except Exception:
+                logger.warning("Gecko detail MC lookup failed for %s", pool.base_token_symbol)
             still_missing += 1
-        logger.info("MC ENRICHMENT SUMMARY: missing_initial=%d gecko_enriched=%d dexscreener_pair_enriched=%d dexscreener_search_enriched=%d still_missing=%d", initial_missing, gecko_enriched, dex_pair_enriched, dex_search_enriched, still_missing)
+        logger.info("MC ENRICHMENT SUMMARY: missing_initial=%d gecko_enriched=%d dexscreener_pair_enriched=%d dexscreener_token_enriched=%d dexscreener_search_enriched=%d still_missing=%d", initial_missing, gecko_enriched, dex_pair_enriched, dex_token_enriched, dex_search_enriched, still_missing)
         return pools
 
     async def run_once(self):
@@ -93,16 +157,12 @@ class Scanner:
             if ratio < settings.min_buy_sell_ratio: stats["sell_pressure"] += 1; continue
             stats["reached_scoring"] += 1
             score = await asyncio.to_thread(self._evaluate, pool); self.db.mark_seen(pool.pool_address, score.total)
-            # Security gate: confirmed honeypots always block. An unavailable/unknown
-            # honeypot result is NOT treated as safe; it may alert only as UNVERIFIED.
             if score.honeypot_checked and score.is_honeypot is True:
                 stats["blocked_by_audit"] += 1; logger.info("BLOCK %s: confirmed honeypot", pool.base_token_symbol); continue
             if not score.honeypot_checked or score.is_honeypot is None:
                 stats["unknown_honeypot"] += 1
                 logger.info("UNVERIFIED %s: honeypot result unavailable", pool.base_token_symbol)
             if not score.contract_available or score.contract_verified is not True: stats["unverified_contract"] += 1; continue
-            # Tax limits only apply when the honeypot service actually returned a
-            # definitive result. Unknown results are explicitly marked UNVERIFIED.
             if score.honeypot_checked:
                 if score.buy_tax is not None and score.buy_tax > settings.max_buy_tax_pct: stats["bad_tax"] += 1; continue
                 if score.sell_tax is None or score.sell_tax > settings.max_sell_tax_pct: stats["bad_tax"] += 1; continue
