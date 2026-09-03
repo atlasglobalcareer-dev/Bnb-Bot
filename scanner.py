@@ -19,12 +19,7 @@ class Scanner:
         self.honeypot = HoneypotClient()
 
     def _candidate_pools(self):
-        """Pull a wider candidate universe before applying the micro-cap filters.
-
-        Three pages was routinely producing a universe dominated by pools already
-        above the $50k ceiling. Six pages per feed gives the scanner more chances
-        to find mature, sub-$50k pools without weakening the safety thresholds.
-        """
+        """Pull a wider candidate universe before applying the micro-cap filters."""
         pools = []
         for fetch in (self.gecko.new_pools, self.gecko.trending_pools):
             for page in range(1, 7):
@@ -64,9 +59,7 @@ class Scanner:
 
     @staticmethod
     def _apply_dex_pair(pool, pair):
-        """Fill only market-data fields that DexScreener actually reports.
-        Never substitute FDV for market cap: the scanner requires real MC.
-        """
+        """Fill only market-data fields that DexScreener actually reports. Never use FDV as MC."""
         mc = float(pair.get("marketCap") or 0)
         if mc <= 0:
             return False
@@ -74,12 +67,9 @@ class Scanner:
         pool.price_usd = float(pair.get("priceUsd") or pool.price_usd or 0)
         pool.liquidity_usd = float((pair.get("liquidity") or {}).get("usd") or pool.liquidity_usd or 0)
         vol = pair.get("volume") or {}
-        if float(vol.get("h24") or 0) > 0:
-            pool.volume_24h_usd = float(vol.get("h24"))
-        if float(vol.get("h6") or 0) > 0:
-            pool.volume_6h_usd = float(vol.get("h6"))
-        if float(vol.get("h1") or 0) > 0:
-            pool.volume_1h_usd = float(vol.get("h1"))
+        if float(vol.get("h24") or 0) > 0: pool.volume_24h_usd = float(vol.get("h24"))
+        if float(vol.get("h6") or 0) > 0: pool.volume_6h_usd = float(vol.get("h6"))
+        if float(vol.get("h1") or 0) > 0: pool.volume_1h_usd = float(vol.get("h1"))
         tx = pair.get("txns") or {}
         h1 = tx.get("h1") or {}
         if h1:
@@ -95,27 +85,22 @@ class Scanner:
         initial_missing = sum(1 for p in pools if p.market_cap_usd <= 0)
         gecko_enriched = dex_pair_enriched = dex_token_enriched = dex_search_enriched = still_missing = 0
         for pool in pools:
-            if pool.market_cap_usd > 0:
-                continue
+            if pool.market_cap_usd > 0: continue
             try:
                 mc = await asyncio.to_thread(self.gecko.dexscreener_market_cap, pool.pool_address)
                 if mc > 0:
-                    pool.market_cap_usd = mc
-                    dex_pair_enriched += 1
-                    continue
+                    pool.market_cap_usd = mc; dex_pair_enriched += 1; continue
             except Exception:
                 logger.warning("DexScreener pair MC lookup failed for %s", pool.base_token_symbol)
             if not pool.token_address:
-                still_missing += 1
-                continue
+                still_missing += 1; continue
             try:
                 pairs = await asyncio.to_thread(self.gecko.token_pairs, pool.token_address)
                 usable = self._usable_dex_pairs(pairs)
                 exact = [p for p in usable if str(p.get("pairAddress", "")).lower() == pool.pool_address.lower()]
                 chosen = exact[0] if exact else (usable[0] if usable else None)
                 if chosen and self._apply_dex_pair(pool, chosen):
-                    dex_token_enriched += 1
-                    continue
+                    dex_token_enriched += 1; continue
             except Exception:
                 logger.warning("DexScreener token lookup failed for %s", pool.base_token_symbol)
             try:
@@ -124,16 +109,13 @@ class Scanner:
                 exact = [p for p in usable if str(p.get("pairAddress", "")).lower() == pool.pool_address.lower()]
                 chosen = exact[0] if exact else (usable[0] if usable else None)
                 if chosen and self._apply_dex_pair(pool, chosen):
-                    dex_search_enriched += 1
-                    continue
+                    dex_search_enriched += 1; continue
             except Exception:
                 logger.warning("DexScreener search failed for %s", pool.base_token_symbol)
             try:
                 detail = await asyncio.to_thread(self.gecko.pool_detail, pool.pool_address)
                 if detail and detail.market_cap_usd > 0:
-                    pool.__dict__.update(detail.__dict__)
-                    gecko_enriched += 1
-                    continue
+                    pool.__dict__.update(detail.__dict__); gecko_enriched += 1; continue
             except Exception:
                 logger.warning("Gecko detail MC lookup failed for %s", pool.base_token_symbol)
             still_missing += 1
@@ -164,8 +146,7 @@ class Scanner:
             if score.honeypot_checked and score.is_honeypot is True:
                 stats["blocked_by_audit"] += 1; logger.info("BLOCK %s: confirmed honeypot", pool.base_token_symbol); continue
             if not score.honeypot_checked or score.is_honeypot is None:
-                stats["unknown_honeypot"] += 1
-                logger.info("UNVERIFIED %s: honeypot result unavailable", pool.base_token_symbol)
+                stats["unknown_honeypot"] += 1; logger.info("UNVERIFIED %s: honeypot result unavailable", pool.base_token_symbol)
             if not score.contract_available or score.contract_verified is not True: stats["unverified_contract"] += 1; continue
             if score.honeypot_checked:
                 if score.buy_tax is not None and score.buy_tax > settings.max_buy_tax_pct: stats["bad_tax"] += 1; continue
@@ -179,7 +160,7 @@ class Scanner:
             if delivered is not True: stats["telegram_delivery_failed"] += 1; failures += 1; continue
             self.db.record_alert(pool.pool_address, pool.base_token_symbol, score.total, mc); stats["alerts_sent"] += 1
             logger.info("ALERT SENT: %s score=%.1f mcap=%.0f", pool.base_token_symbol, score.total, mc)
-        logger.info("FILTER SUMMARY: candidates=%d missing_mc=%d below_min_mc=%d at_or_above_%.0fk=%d too_new=%d too_old=%d low_liquidity=%d low_liquidity_mc_ratio=%d low_volume=%d low_transactions=%d sell_pressure=%d reached_scoring=%d blocked=%d unknown_honeypot=%d unverified_contract=%d bad_tax=%d bad_owner=%d bad_holders=%d low_score=%d cooldown=%d telegram_unconfigured=%d telegram_failed=%d alerts_sent=%d", len(pools), stats["mc_missing_or_zero"], stats["mc_below_min"], settings.max_market_cap_usd / 1000, stats["mc_at_or_above_max"], stats["age_too_new"], stats["age_too_old"], stats["low_liquidity"], stats["low_liquidity_mc_ratio"], stats["volume_below_floor"], stats["transactions_below_floor"], stats["sell_pressure"], stats["reached_scoring"], stats["blocked_by_audit"], stats["unknown_honeypot"], stats["unverified_contract"], stats["bad_tax"], stats["bad_owner"], stats["bad_holders"], stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_unconfigured"], stats["telegram_delivery_failed"], stats["alerts_sent"])
+        logger.info("FILTER SUMMARY: candidates=%d missing_mc=%d below_min_mc=%d at_or_above_%.0fk=%d too_new=%d too_old=%d low_liquidity=%d low_liquidity_mc_ratio=%d low_volume=%d low_transactions=%d sell_pressure=%d reached_scoring=%d blocked=%d unknown_honeypot=%d unverified_contract=%d bad_tax=%d bad_owner=%d bad_holders=%d low_score=%d cooldown=%d telegram_unconfigured=%d telegram_failed=%d alerts_sent=%d", len(pools), stats["mc_missing_or_zero"], stats["mc_below_min"], settings.max_market_cap_usd / 1000, stats["mc_at_or_above_max"], stats["age_too_new"], stats["age_too_old"], stats["liquidity_below_floor"], stats["low_liquidity_mc_ratio"], stats["volume_below_floor"], stats["transactions_below_floor"], stats["sell_pressure"], stats["reached_scoring"], stats["blocked_by_audit"], stats["unknown_honeypot"], stats["unverified_contract"], stats["bad_tax"], stats["bad_owner"], stats["bad_holders"], stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_unconfigured"], stats["telegram_delivery_failed"], stats["alerts_sent"])
         if failures: raise RuntimeError(f"Telegram delivery failed for {failures} alert(s)")
         return stats["alerts_sent"]
 
