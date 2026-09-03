@@ -19,11 +19,19 @@ class Scanner:
         self.honeypot = HoneypotClient()
 
     def _candidate_pools(self):
+        """Pull a wider candidate universe before applying the micro-cap filters.
+
+        Three pages was routinely producing a universe dominated by pools already
+        above the $50k ceiling. Six pages per feed gives the scanner more chances
+        to find mature, sub-$50k pools without weakening the safety thresholds.
+        """
         pools = []
         for fetch in (self.gecko.new_pools, self.gecko.trending_pools):
-            for page in (1, 2, 3):
-                try: pools.extend(fetch(page=page))
-                except Exception: logger.exception("Failed to fetch candidate pools page=%d", page)
+            for page in range(1, 7):
+                try:
+                    pools.extend(fetch(page=page))
+                except Exception:
+                    logger.exception("Failed to fetch candidate pools page=%d", page)
         return list({p.pool_address: p for p in pools if p.pool_address}.values())
 
     def _evaluate(self, pool):
@@ -89,7 +97,6 @@ class Scanner:
         for pool in pools:
             if pool.market_cap_usd > 0:
                 continue
-            # 1) Exact pair lookup: safest match to the candidate pool.
             try:
                 mc = await asyncio.to_thread(self.gecko.dexscreener_market_cap, pool.pool_address)
                 if mc > 0:
@@ -101,7 +108,6 @@ class Scanner:
             if not pool.token_address:
                 still_missing += 1
                 continue
-            # 2) Token endpoint: more reliable than /search for an exact contract.
             try:
                 pairs = await asyncio.to_thread(self.gecko.token_pairs, pool.token_address)
                 usable = self._usable_dex_pairs(pairs)
@@ -112,7 +118,6 @@ class Scanner:
                     continue
             except Exception:
                 logger.warning("DexScreener token lookup failed for %s", pool.base_token_symbol)
-            # 3) Search endpoint fallback.
             try:
                 pairs = await asyncio.to_thread(self.gecko.search_token_pairs, pool.token_address)
                 usable = self._usable_dex_pairs(pairs)
@@ -123,7 +128,6 @@ class Scanner:
                     continue
             except Exception:
                 logger.warning("DexScreener search failed for %s", pool.base_token_symbol)
-            # 4) Gecko detail is last resort only; rate limiting prevents a burst.
             try:
                 detail = await asyncio.to_thread(self.gecko.pool_detail, pool.pool_address)
                 if detail and detail.market_cap_usd > 0:
@@ -175,7 +179,7 @@ class Scanner:
             if delivered is not True: stats["telegram_delivery_failed"] += 1; failures += 1; continue
             self.db.record_alert(pool.pool_address, pool.base_token_symbol, score.total, mc); stats["alerts_sent"] += 1
             logger.info("ALERT SENT: %s score=%.1f mcap=%.0f", pool.base_token_symbol, score.total, mc)
-        logger.info("FILTER SUMMARY: candidates=%d missing_mc=%d below_min_mc=%d at_or_above_%.0fk=%d too_new=%d too_old=%d low_liquidity=%d low_liquidity_mc_ratio=%d low_volume=%d low_transactions=%d sell_pressure=%d reached_scoring=%d blocked=%d unknown_honeypot=%d unverified_contract=%d bad_tax=%d bad_owner=%d bad_holders=%d low_score=%d cooldown=%d telegram_unconfigured=%d telegram_failed=%d alerts_sent=%d", len(pools), stats["mc_missing_or_zero"], stats["mc_below_min"], settings.max_market_cap_usd / 1000, stats["mc_at_or_above_max"], stats["age_too_new"], stats["age_too_old"], stats["liquidity_below_floor"], stats["low_liquidity_mc_ratio"], stats["volume_below_floor"], stats["transactions_below_floor"], stats["sell_pressure"], stats["reached_scoring"], stats["blocked_by_audit"], stats["unknown_honeypot"], stats["unverified_contract"], stats["bad_tax"], stats["bad_owner"], stats["bad_holders"], stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_unconfigured"], stats["telegram_delivery_failed"], stats["alerts_sent"])
+        logger.info("FILTER SUMMARY: candidates=%d missing_mc=%d below_min_mc=%d at_or_above_%.0fk=%d too_new=%d too_old=%d low_liquidity=%d low_liquidity_mc_ratio=%d low_volume=%d low_transactions=%d sell_pressure=%d reached_scoring=%d blocked=%d unknown_honeypot=%d unverified_contract=%d bad_tax=%d bad_owner=%d bad_holders=%d low_score=%d cooldown=%d telegram_unconfigured=%d telegram_failed=%d alerts_sent=%d", len(pools), stats["mc_missing_or_zero"], stats["mc_below_min"], settings.max_market_cap_usd / 1000, stats["mc_at_or_above_max"], stats["age_too_new"], stats["age_too_old"], stats["low_liquidity"], stats["low_liquidity_mc_ratio"], stats["volume_below_floor"], stats["transactions_below_floor"], stats["sell_pressure"], stats["reached_scoring"], stats["blocked_by_audit"], stats["unknown_honeypot"], stats["unverified_contract"], stats["bad_tax"], stats["bad_owner"], stats["bad_holders"], stats["score_below_threshold"], stats["already_alerted_recently"], stats["telegram_unconfigured"], stats["telegram_delivery_failed"], stats["alerts_sent"])
         if failures: raise RuntimeError(f"Telegram delivery failed for {failures} alert(s)")
         return stats["alerts_sent"]
 
