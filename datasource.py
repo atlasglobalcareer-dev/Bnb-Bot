@@ -9,9 +9,8 @@ BASE_URL = "https://api.geckoterminal.com/api/v2"
 DEXSCREENER_URL = "https://api.dexscreener.com"
 HEADERS = {"Accept": "application/json;version=20230302"}
 DEX_HEADERS = {"Accept": "application/json"}
-# Stay below GeckoTerminal's public rate limit and avoid burst retries.
-_rate_limiter = RateLimiter(max_calls=20, period_seconds=60)
-_dex_rate_limiter = RateLimiter(max_calls=200, period_seconds=60)
+_rate_limiter = RateLimiter(max_calls=10, period_seconds=60)
+_dex_rate_limiter = RateLimiter(max_calls=180, period_seconds=60)
 
 class PoolData:
     def __init__(self, raw: dict):
@@ -97,26 +96,28 @@ class GeckoTerminalClient:
         item = data.get("data")
         return PoolData(item) if item else None
 
-    def dexscreener_market_cap(self, pool_address):
+    def _dex_get(self, path, params=None):
         _dex_rate_limiter.acquire()
-        resp = self._dex_client.get(f"/latest/dex/pairs/{self.network}/{pool_address}")
+        resp = self._dex_client.get(path, params=params or {})
         resp.raise_for_status()
-        pairs = resp.json().get("pairs") or []
-        for pair in pairs:
-            if str(pair.get("pairAddress", "")).lower() != str(pool_address).lower():
-                continue
-            mc = _to_float(pair.get("marketCap"))
-            if mc > 0:
-                return mc
+        return resp.json()
+
+    def dexscreener_market_cap(self, pool_address):
+        data = self._dex_get(f"/latest/dex/pairs/{self.network}/{pool_address}")
+        for pair in data.get("pairs") or []:
+            if str(pair.get("pairAddress", "")).lower() == str(pool_address).lower():
+                return _to_float(pair.get("marketCap"))
         return 0.0
 
+    def token_pairs(self, token_address):
+        """Return all DexScreener BSC pairs for a token address."""
+        data = self._dex_get(f"/latest/dex/tokens/{token_address}")
+        return [p for p in (data.get("pairs") or []) if str(p.get("chainId", "")).lower() == self.network]
+
     def search_token_pairs(self, token_address):
-        """Discover BSC pairs for a token so we can use a pair with reported MC."""
-        _dex_rate_limiter.acquire()
-        resp = self._dex_client.get("/latest/dex/search", params={"q": token_address})
-        resp.raise_for_status()
-        pairs = resp.json().get("pairs") or []
-        return [p for p in pairs if str(p.get("chainId", "")).lower() == self.network]
+        """Fallback token discovery for tokens not returned by the token endpoint."""
+        data = self._dex_get("/latest/dex/search", params={"q": token_address})
+        return [p for p in (data.get("pairs") or []) if str(p.get("chainId", "")).lower() == self.network]
 
     def close(self):
         self._client.close()
